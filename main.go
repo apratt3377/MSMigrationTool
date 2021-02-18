@@ -9,23 +9,37 @@ import (
   "github.com/ethereum/go-ethereum/rlp"
   "github.com/ethereum/go-ethereum/common"
   "github.com/ethereum/go-ethereum/log"
+  "github.com/ethereum/go-ethereum/core"
   "github.com/ethereum/go-ethereum/core/state"
   "github.com/ethereum/go-ethereum/core/rawdb"
   "github.com/ethereum/go-ethereum/crypto"
+  //"github.com/ethereum/go-ethereum/core/vm"
 )
 
+//TODOS
+//1. Create privateStateService at block 0 (assume migrating to a fresh node)
+//2. In for loop, use privateStateService at parent block to add to managedStates
+//3. Simple cli for user input (upgrade blockNum start)
+//4. Cleanup, separate into useful functions
 func main() {
   
   var emptyCodeHash = crypto.Keccak256(nil)
   
   //read in database for tenant to be migrated
-  path := "/Users/angelapratt/projects/quorum-creator/network/7-nodes-istanbul-tessera-bash/qdata/dd2/geth/chaindata"
+  path := "/Users/angelapratt/projects/quorum-creator/network/3-nodes-raft-tessera-bash/qdata/dd1/geth/chaindata"
   diskdb, _ := rawdb.NewLevelDBDatabase(path, 0, 0, "")
+  
+  //create blockchain with only necessary components
+  chainConfig := rawdb.ReadChainConfig(diskdb, rawdb.ReadCanonicalHash(diskdb, 0))
+  bc := core.NewBlockChainBare(diskdb, chainConfig)
+  
+  //how do we determine psi if its different than the default "private"
+  tenantPSI := "private"
   
   //create trie database from leveldb
   triedb := trie.NewDatabase(diskdb)
   
-  blockNum := 127
+  blockNum := 2
   
   //each iteration takes about ~200-500ms each for between ~100-500 creation txs
   //test doing sequentially (db caching) vs in parallel
@@ -35,15 +49,13 @@ func main() {
 
     //get blockhashes for block X and X-1
     blockHash1 := rawdb.ReadBlock(diskdb, rawdb.ReadCanonicalHash(diskdb, uint64(i-1)), uint64(i-1)).Root()
-    blockHash2 := rawdb.ReadBlock(diskdb, rawdb.ReadCanonicalHash(diskdb, uint64(i)), uint64(i)).Root()
-  
+    blockX := rawdb.ReadBlock(diskdb, rawdb.ReadCanonicalHash(diskdb, uint64(i)), uint64(i))
+    blockHash2 := blockX.Root()
     //get private state roots for block x and x+1
-    root1, _ := diskdb.Get(append([]byte("P"), blockHash1[:]...))
-    root2, _ := diskdb.Get(append([]byte("P"), blockHash2[:]...))
-    firstRoot := common.BytesToHash(root1)
-    secondRoot := common.BytesToHash(root2)
-    fmt.Println(firstRoot)
-    fmt.Println(secondRoot)
+    firstRoot := rawdb.GetPrivateStateRoot(diskdb,blockHash1)
+    secondRoot := rawdb.GetPrivateStateRoot(diskdb,blockHash2)
+    fmt.Println(firstRoot.Hex())
+    fmt.Println(secondRoot.Hex())
   
     //get the tries
     trie1, _ := trie.NewSecure(firstRoot, triedb)
@@ -56,8 +68,11 @@ func main() {
     //create maps/lists to store the changed accounts and their addresses
     //will use these to add to proper states in PrivateStateService
     var allAddresses = make([]common.Address, 0)
-    var emptyAddresses = make(map[common.Address]state.Account)
-    var addresses = make(map[common.Address]state.Account)
+    
+    //privateStateService logic    
+    privateStateManager, _ := core.NewMultiplePrivateStateManager(bc, blockHash1)
+    emptyState, _ := privateStateManager.GetDefaultState()
+    privateState, _ := privateStateManager.GetPrivateState(tenantPSI)
   
     //create the difference iterator
     //iterates over nodes in trie2 that aren't in trie1
@@ -77,6 +92,7 @@ func main() {
       firstAddress := common.BytesToAddress(trie2.GetKey(itDiff.LeafKey()))
     
       //get account and decode to Account Object
+      //how to handle any extraData???
       firstAccount := itDiff.LeafBlob()
       var data state.Account
       if err := rlp.DecodeBytes(firstAccount, &data); err != nil {
@@ -86,12 +102,12 @@ func main() {
       //collect the address
       //empty map doesnt actually need the Account, because will be inserted in the EmptyState at the address as an Empty Account
       allAddresses = append(allAddresses, firstAddress)
-      emptyAddresses[firstAddress] = data
+      emptyState.CreateEmptyAccount(firstAddress)
     
       //check if the Account is not empty (has code associated with it)
       //will pick up user created contracts and contracts created by other contracts
       if(!bytes.Equal(data.CodeHash, emptyCodeHash)) {
-        addresses[firstAddress] = data
+        privateState.CopyAccount(firstAddress, data)
       }
     }
   
@@ -105,36 +121,27 @@ func main() {
           log.Error("Failed to decode state object", "err", err)
         }
         allAddresses = append(allAddresses, address)
-        emptyAddresses[address] = data
+        emptyState.CreateEmptyAccount(address)
       
         if(!bytes.Equal(data.CodeHash, emptyCodeHash)) {
-          addresses[address] = data
+          privateState.CopyAccount(address, data)
         }
       }
     }
+    
+    fmt.Println("emptyState", emptyState)
+    fmt.Println("addr exists empty", allAddresses[0], emptyState.Exist(allAddresses[0]))
+    fmt.Println("addr exists private", allAddresses[0], privateState.Exist(allAddresses[0]))
   
     duration := time.Since(start)
-  
-    //print out information for now
-    //in future will add these accounts to managedStates(empty, private or psi) to newly created or retrieved privateStateService on upgraded quorum
+    
   
     fmt.Println("duration", duration)
   
     fmt.Println("numtxs", len(allAddresses))
-  
-    // for _, acc := range allAddresses {
-    //   fmt.Println("acc", acc)
-    // }
-    // fmt.Println("------------")
-    // 
-    // for k, _ := range emptyAddresses {
-    //   fmt.Println("empty", k)
-    // }
-    // fmt.Println("------------")
-    // 
-    // for k, v := range addresses {
-    //   fmt.Println("keep", k, "acc", v)
-    // }
+    
+    //write and commit privateStateManager
+    privateStateManager.CommitAndWrite(blockX)
   }
   
   totalDuration := time.Since(totalTimeStart)
